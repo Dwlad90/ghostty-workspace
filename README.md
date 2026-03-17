@@ -69,9 +69,11 @@ See [`example.yaml`](example.yaml) for a fully commented reference. Summary:
 | `focus` | bool | `false` | Give this tab focus after launch. |
 | `reuse_if_exists` | bool | `window.reuse_existing_tabs` | Override the global reuse setting. |
 | `enabled` | bool | `true` | Set to `false` to skip without removing from config. |
-| `split` | object | | Split pane configuration (see below). |
+| `split` | object | | Simple 2-pane split (see below). Mutually exclusive with `panes`/`layout`. |
+| `layout` | string | | Multi-pane layout shorthand (see below). Requires `panes` list. |
+| `panes` | list \| object | | Multi-pane config: flat list (with `layout`) or tree (without). |
 
-### `tabs[].split`
+### `tabs[].split` (2-pane)
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -81,20 +83,106 @@ See [`example.yaml`](example.yaml) for a fully commented reference. Summary:
 | `second_pane_command` | string | | Command for the second pane. |
 | `second_pane_working_dir` | string | | Working directory for the second pane. |
 
+### Multi-pane layouts (3+ panes)
+
+For tabs that need more than 2 panes, use `layout` + `panes` (shorthand) or a nested `panes` tree. These are mutually exclusive with the `split` key.
+
+#### Layout shorthand (inspired by [gsx](https://github.com/minorole/gsx))
+
+`layout` is a dash-separated string where each number is the column count for that row. Panes are assigned left-to-right, top-to-bottom.
+
+| Notation | Preset name | Result |
+|----------|-------------|--------|
+| `"2"` | | 2 columns |
+| `"3"` | | 3 columns |
+| `"1-1"` | `duo` | 2 rows |
+| `"1-2"` | `trio` | 1 top, 2 bottom |
+| `"2-2"` | `quad` | 2×2 grid |
+| `"1-3"` | `dashboard` | 1 top, 3 bottom |
+| `"2-2-2"` | | 3 rows × 2 cols |
+
+```yaml
+- key: dashboard
+  title: Dashboard
+  working_dir: ~/app
+  layout: "2-2"                  # or "quad"
+  panes:
+    - command: htop              # top-left
+    - command: kubectl get pods  # top-right
+    - command: "tail -f app.log" # bottom-left
+    - command: lazygit           # bottom-right
+```
+
+#### Tree notation (maximum flexibility)
+
+Each node is either a leaf (`command`/`working_dir`) or a split (`direction` + `panes` with 2+ children). Nodes with >2 children are auto-balanced into equal-size binary splits.
+
+```yaml
+- key: dev
+  title: Dev Layout
+  panes:
+    direction: right
+    ratio: "70/30"
+    panes:
+      - direction: down            # left: editor + terminal
+        ratio: "75/25"
+        panes:
+          - command: nvim
+            working_dir: ~/app
+          - working_dir: ~/app
+      - direction: down            # right: tests + logs
+        panes:
+          - command: "npm test --watch"
+            working_dir: ~/app
+          - command: "tail -f logs/dev.log"
+            working_dir: ~/app
+```
+
+Result:
+
+```
+┌──────────────┬──────────┐
+│              │ npm test │
+│     nvim     ├──────────┤
+│              │ tail log │
+├──────────────┤          │
+│   terminal   │          │
+└──────────────┴──────────┘
+```
+
+#### Flat pane list (no layout key)
+
+A `panes` list without `layout` creates side-by-side columns:
+
+```yaml
+panes:
+  - command: a
+  - command: b
+  - command: c
+```
+
+### Pane leaf properties
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `command` | string | | Command to run in this pane. |
+| `working_dir` | string | tab's `working_dir` | Working directory for this pane. |
+
 ## Tests
 
 ```bash
 python3 test_ghostty_workspace.py
 ```
 
-81 tests covering config parsing, payload generation, AppleScript invariants, and CLI behavior. No macOS, Ghostty, or osascript required to run them.
+109 tests covering config parsing, payload generation, multi-pane layouts, AppleScript invariants, and CLI behavior. No macOS, Ghostty, or osascript required to run them.
 
 ## Known Caveats
 
 - **AppleScript support is preview.** Ghostty's scripting API may change between releases.
 - **Tab ordering uses an action loop.** Ghostty's sdef has no `move tab` command, so tabs are reordered by calling `perform action "move_tab:-1"` repeatedly. This works but adds ~50ms per position moved. Use `tab_position: append` to skip reordering entirely.
 - **Tab titles require Accessibility.** Titles are set via Ghostty's `prompt_tab_title` action and System Events UI automation. Without Accessibility permission, tabs are created but titles won't be set.
-- **Split resize is approximate.** Horizontal splits are resized by calculating pixel deltas from the window width. The result is close but not pixel-perfect.
+- **Split resize is approximate.** Horizontal splits are resized by calculating pixel deltas from the window width. The result is close but not pixel-perfect. For multi-pane layouts, resize applies to top-level horizontal splits only.
+- **Multi-pane delay.** Each split adds ~250ms of delay. A 4-pane layout takes ~1s extra; a 9-pane grid ~2s.
 
 ## License
 

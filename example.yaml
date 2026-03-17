@@ -79,6 +79,42 @@ tabs:
     reuse_if_exists: false       # Always create a fresh tab, even if one
                                  # with this title already exists.
 
+  # --- Multi-pane: layout shorthand (inspired by gsx) --------------------
+  # Layout notation: "rows-cols", e.g. "2-2" = 2 rows × 2 cols = 4 panes.
+  # Presets: "duo" (1-1), "trio" (1-2), "quad" (2-2), "dashboard" (1-3).
+  # Panes are assigned left-to-right, top-to-bottom.
+  - key: dashboard
+    title: "Dashboard"
+    working_dir: ~/projects/myapp
+    layout: "2-2"
+    panes:
+      - command: "htop"                          # top-left
+      - command: "watch -n1 kubectl get pods"     # top-right
+      - command: "tail -f /var/log/app.log"       # bottom-left
+      - command: "lazygit"                        # bottom-right
+
+  # --- Multi-pane: tree notation (max flexibility) -----------------------
+  # Nested binary splits. Each node has direction, optional ratio, and
+  # exactly 2 children (or >2 for auto-balanced equal-size splits).
+  - key: dev-layout
+    title: "Dev Layout"
+    panes:
+      direction: right
+      ratio: "70/30"
+      panes:
+        - direction: down
+          ratio: "75/25"
+          panes:
+            - command: "nvim"
+              working_dir: ~/projects/myapp
+            - working_dir: ~/projects/myapp
+        - direction: down
+          panes:
+            - command: "npm run test -- --watch"
+              working_dir: ~/projects/myapp
+            - command: "tail -f logs/dev.log"
+              working_dir: ~/projects/myapp
+
   # --- Disabled tab: stays in config but is skipped ----------------------
   - key: legacy
     title: "Legacy DB"

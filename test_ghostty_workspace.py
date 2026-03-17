@@ -931,6 +931,426 @@ class TestResolveConfig(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# PaneNode / multi-pane
+# ---------------------------------------------------------------------------
+
+class TestPaneNode(unittest.TestCase):
+
+    def test_leaf_is_leaf(self):
+        n = gw.PaneNode(command="vim")
+        self.assertTrue(n.is_leaf)
+
+    def test_split_is_not_leaf(self):
+        left = gw.PaneNode(command="a")
+        right = gw.PaneNode(command="b")
+        n = gw.PaneNode(direction="right", ratio="0.5/0.5", children=(left, right))
+        self.assertFalse(n.is_leaf)
+
+
+class TestBuildBalancedTree(unittest.TestCase):
+
+    def test_single_node_identity(self):
+        leaf = gw.PaneNode(command="vim")
+        self.assertIs(gw._build_balanced_tree([leaf], "right"), leaf)
+
+    def test_two_nodes(self):
+        a, b = gw.PaneNode(command="a"), gw.PaneNode(command="b")
+        tree = gw._build_balanced_tree([a, b], "right")
+        self.assertFalse(tree.is_leaf)
+        self.assertEqual(tree.direction, "right")
+        self.assertIs(tree.children[0], a)
+        self.assertIs(tree.children[1], b)
+
+    def test_three_nodes_right_skewed(self):
+        a = gw.PaneNode(command="a")
+        b = gw.PaneNode(command="b")
+        c = gw.PaneNode(command="c")
+        tree = gw._build_balanced_tree([a, b, c], "right")
+        self.assertIs(tree.children[0], a)
+        inner = tree.children[1]
+        self.assertIs(inner.children[0], b)
+        self.assertIs(inner.children[1], c)
+        # First split: 1/3 vs 2/3
+        left, right = tree.ratio.split("/")
+        self.assertAlmostEqual(float(left), 1 / 3, places=4)
+
+    def test_four_nodes_ratios(self):
+        nodes = [gw.PaneNode(command=str(i)) for i in range(4)]
+        tree = gw._build_balanced_tree(nodes, "down")
+        # Root: 1/4 vs 3/4
+        left, _ = tree.ratio.split("/")
+        self.assertAlmostEqual(float(left), 0.25, places=4)
+        # Second level: 1/3 vs 2/3
+        inner = tree.children[1]
+        left2, _ = inner.ratio.split("/")
+        self.assertAlmostEqual(float(left2), 1 / 3, places=4)
+
+
+class TestParseLayoutShorthand(unittest.TestCase):
+
+    def test_two_columns(self):
+        panes = [{"command": "a"}, {"command": "b"}]
+        tree = gw.parse_layout_shorthand("2", panes, "/tmp")
+        self.assertFalse(tree.is_leaf)
+        self.assertEqual(tree.direction, "right")
+        self.assertEqual(tree.children[0].command, "a")
+        self.assertEqual(tree.children[1].command, "b")
+
+    def test_2x2_grid(self):
+        panes = [{"command": str(i)} for i in range(4)]
+        tree = gw.parse_layout_shorthand("2-2", panes, "/tmp")
+        self.assertEqual(tree.direction, "down")
+        top, bottom = tree.children
+        self.assertEqual(top.direction, "right")
+        self.assertEqual(bottom.direction, "right")
+        self.assertEqual(top.children[0].command, "0")
+        self.assertEqual(top.children[1].command, "1")
+        self.assertEqual(bottom.children[0].command, "2")
+        self.assertEqual(bottom.children[1].command, "3")
+
+    def test_1_2_layout(self):
+        panes = [{"command": "top"}, {"command": "bl"}, {"command": "br"}]
+        tree = gw.parse_layout_shorthand("1-2", panes, "/tmp")
+        self.assertEqual(tree.direction, "down")
+        self.assertTrue(tree.children[0].is_leaf)
+        self.assertEqual(tree.children[0].command, "top")
+        bottom = tree.children[1]
+        self.assertEqual(bottom.direction, "right")
+        self.assertEqual(bottom.children[0].command, "bl")
+        self.assertEqual(bottom.children[1].command, "br")
+
+    def test_preset_quad(self):
+        panes = [{"command": str(i)} for i in range(4)]
+        tree = gw.parse_layout_shorthand("quad", panes, "/tmp")
+        self.assertEqual(tree.direction, "down")
+
+    def test_mismatch_count_raises(self):
+        with self.assertRaises(SystemExit):
+            gw.parse_layout_shorthand("2-2", [{"command": "a"}] * 3, "/tmp")
+
+    def test_invalid_layout_raises(self):
+        with self.assertRaises(SystemExit):
+            gw.parse_layout_shorthand("abc", [], "/tmp")
+
+    def test_single_pane_raises(self):
+        with self.assertRaises(SystemExit):
+            gw.parse_layout_shorthand("1", [{"command": "a"}], "/tmp")
+
+    def test_working_dir_inherited(self):
+        panes = [{"command": "a"}, {"command": "b"}]
+        tree = gw.parse_layout_shorthand("2", panes, "/home/user")
+        self.assertEqual(tree.children[0].working_dir, "/home/user")
+
+    def test_working_dir_per_pane(self):
+        panes = [{"command": "a", "working_dir": "/tmp"}, {"command": "b"}]
+        tree = gw.parse_layout_shorthand("2", panes, "/home/user")
+        self.assertEqual(tree.children[0].working_dir, "/tmp")
+        self.assertEqual(tree.children[1].working_dir, "/home/user")
+
+
+class TestParsePaneTree(unittest.TestCase):
+
+    def test_simple_two_pane(self):
+        obj = {
+            "direction": "right",
+            "ratio": "60/40",
+            "panes": [
+                {"command": "vim"},
+                {"command": "make"},
+            ],
+        }
+        tree = gw.parse_pane_tree(obj, "/tmp")
+        self.assertEqual(tree.direction, "right")
+        self.assertEqual(tree.children[0].command, "vim")
+        self.assertEqual(tree.children[1].command, "make")
+
+    def test_nested_tree(self):
+        obj = {
+            "direction": "down",
+            "panes": [
+                {"command": "top"},
+                {
+                    "direction": "right",
+                    "panes": [
+                        {"command": "bl"},
+                        {"command": "br"},
+                    ],
+                },
+            ],
+        }
+        tree = gw.parse_pane_tree(obj, "/tmp")
+        self.assertTrue(tree.children[0].is_leaf)
+        self.assertFalse(tree.children[1].is_leaf)
+
+    def test_three_children_auto_balanced(self):
+        obj = {
+            "direction": "right",
+            "panes": [
+                {"command": "a"},
+                {"command": "b"},
+                {"command": "c"},
+            ],
+        }
+        tree = gw.parse_pane_tree(obj, "/tmp")
+        self.assertEqual(tree.children[0].command, "a")
+        inner = tree.children[1]
+        self.assertEqual(inner.children[0].command, "b")
+        self.assertEqual(inner.children[1].command, "c")
+
+    def test_invalid_direction_raises(self):
+        with self.assertRaises(SystemExit):
+            gw.parse_pane_tree({"direction": "diagonal", "panes": [{}, {}]}, "/tmp")
+
+
+class TestFlattenPaneTree(unittest.TestCase):
+
+    def test_single_leaf(self):
+        tree = gw.PaneNode(command="vim", working_dir="/tmp")
+        ops, leaves = gw.flatten_pane_tree(tree)
+        self.assertEqual(ops, [])
+        self.assertEqual(len(leaves), 1)
+        self.assertEqual(leaves[0]["termIndex"], 0)
+        self.assertEqual(leaves[0]["paneCmd"], "vim")
+
+    def test_simple_split(self):
+        tree = gw.PaneNode(
+            direction="right", ratio="0.500000/0.500000",
+            children=(
+                gw.PaneNode(command="a", working_dir="/a"),
+                gw.PaneNode(command="b", working_dir="/b"),
+            ),
+        )
+        ops, leaves = gw.flatten_pane_tree(tree)
+        self.assertEqual(len(ops), 1)
+        self.assertEqual(ops[0]["parentIndex"], 0)
+        self.assertEqual(ops[0]["direction"], "right")
+        self.assertEqual(len(leaves), 2)
+        self.assertEqual(leaves[0]["termIndex"], 0)
+        self.assertEqual(leaves[1]["termIndex"], 1)
+
+    def test_2x2_grid_indices(self):
+        """2x2 grid: split(down) of split(right) × 2."""
+        tree = gw.PaneNode(
+            direction="down", ratio="0.500000/0.500000",
+            children=(
+                gw.PaneNode(
+                    direction="right", ratio="0.500000/0.500000",
+                    children=(
+                        gw.PaneNode(command="TL"),
+                        gw.PaneNode(command="TR"),
+                    ),
+                ),
+                gw.PaneNode(
+                    direction="right", ratio="0.500000/0.500000",
+                    children=(
+                        gw.PaneNode(command="BL"),
+                        gw.PaneNode(command="BR"),
+                    ),
+                ),
+            ),
+        )
+        ops, leaves = gw.flatten_pane_tree(tree)
+        self.assertEqual(len(ops), 3)
+        self.assertEqual(len(leaves), 4)
+
+        # Op 0: split term 0 down → creates term 1
+        self.assertEqual(ops[0]["parentIndex"], 0)
+        self.assertEqual(ops[0]["direction"], "down")
+        # Op 1: split term 0 right → creates term 2
+        self.assertEqual(ops[1]["parentIndex"], 0)
+        self.assertEqual(ops[1]["direction"], "right")
+        # Op 2: split term 1 right → creates term 3
+        self.assertEqual(ops[2]["parentIndex"], 1)
+        self.assertEqual(ops[2]["direction"], "right")
+
+        # Leaf assignments: TL@0, TR@2, BL@1, BR@3
+        cmds = {l["termIndex"]: l["paneCmd"] for l in leaves}
+        self.assertEqual(cmds[0], "TL")
+        self.assertEqual(cmds[2], "TR")
+        self.assertEqual(cmds[1], "BL")
+        self.assertEqual(cmds[3], "BR")
+
+    def test_ops_reference_valid_terminals(self):
+        """Every parentIndex in ops must reference an already-existing terminal."""
+        panes = [{"command": str(i)} for i in range(6)]
+        tree = gw.parse_layout_shorthand("2-2-2", panes, "/tmp")
+        ops, leaves = gw.flatten_pane_tree(tree)
+        existing = {0}
+        for i, op in enumerate(ops):
+            self.assertIn(op["parentIndex"], existing, f"op {i} references non-existent terminal")
+            existing.add(i + 1)
+
+
+class TestMultiPaneIntegration(unittest.TestCase):
+
+    def test_layout_shorthand_in_yaml(self):
+        yaml_str = textwrap.dedent("""
+            window:
+              shell: /bin/sh
+            tabs:
+              - key: dev
+                title: Dev
+                layout: "2-2"
+                panes:
+                  - command: "a"
+                  - command: "b"
+                  - command: "c"
+                  - command: "d"
+        """)
+        tabs = make_tabs(yaml_str)
+        self.assertIsNotNone(tabs[0].pane_tree)
+        self.assertFalse(tabs[0].pane_tree.is_leaf)
+
+    def test_tree_notation_in_yaml(self):
+        yaml_str = textwrap.dedent("""
+            window:
+              shell: /bin/sh
+            tabs:
+              - key: dev
+                title: Dev
+                panes:
+                  direction: right
+                  panes:
+                    - command: vim
+                    - command: make
+        """)
+        tabs = make_tabs(yaml_str)
+        self.assertIsNotNone(tabs[0].pane_tree)
+        self.assertEqual(tabs[0].pane_tree.direction, "right")
+
+    def test_flat_panes_list_without_layout(self):
+        yaml_str = textwrap.dedent("""
+            window:
+              shell: /bin/sh
+            tabs:
+              - key: dev
+                title: Dev
+                panes:
+                  - command: a
+                  - command: b
+                  - command: c
+        """)
+        tabs = make_tabs(yaml_str)
+        self.assertIsNotNone(tabs[0].pane_tree)
+
+    def test_split_and_panes_mutual_exclusion(self):
+        yaml_str = textwrap.dedent("""
+            window:
+              shell: /bin/sh
+            tabs:
+              - key: dev
+                title: Dev
+                split:
+                  enabled: true
+                  direction: right
+                panes:
+                  - command: a
+                  - command: b
+        """)
+        with self.assertRaises(SystemExit):
+            make_tabs(yaml_str)
+
+    def test_backward_compat_split_unchanged(self):
+        yaml_str = textwrap.dedent("""
+            window:
+              shell: /bin/sh
+            tabs:
+              - key: dev
+                title: Dev
+                split:
+                  enabled: true
+                  direction: right
+                  ratio: "70/30"
+                  second_pane_command: make
+        """)
+        tabs = make_tabs(yaml_str)
+        self.assertIsNone(tabs[0].pane_tree)
+        self.assertTrue(tabs[0].split.enabled)
+        self.assertEqual(tabs[0].split.second_pane_command, "make")
+
+    def test_pane_tree_in_payload(self):
+        yaml_str = textwrap.dedent("""
+            window:
+              shell: /bin/sh
+            tabs:
+              - key: dev
+                title: Dev
+                layout: "2"
+                panes:
+                  - command: a
+                  - command: b
+        """)
+        tabs = make_tabs(yaml_str)
+        payload = gw.build_payload(
+            tabs, only_keys=None, force_new_window=False, default_shell="/bin/sh",
+        )
+        tab_data = payload["tabs"][0]
+        self.assertTrue(tab_data["hasMultiPane"])
+        self.assertEqual(len(tab_data["paneOps"]), 1)
+        self.assertEqual(len(tab_data["paneLeaves"]), 2)
+
+    def test_pane_tree_in_applescript(self):
+        payload = {
+            "tabs": [{
+                "key": "dev", "title": "Dev", "workingDir": "/tmp", "command": "",
+                "shell": "/bin/sh", "reuseIfExists": True,
+                "split": {"enabled": False, "direction": "right", "ratio": "0.5/0.5",
+                          "secondPaneCommand": "", "secondPaneWorkingDir": ""},
+                "hasMultiPane": True,
+                "paneOps": [{"parentIndex": 0, "direction": "right", "ratio": "0.5/0.5",
+                             "newPaneWD": "/tmp"}],
+                "paneLeaves": [{"termIndex": 0, "paneCmd": "a", "paneWD": "/tmp"},
+                               {"termIndex": 1, "paneCmd": "b", "paneWD": "/tmp"}],
+            }],
+            "forceNewWindow": False, "focusKey": "dev",
+            "defaultShell": "/bin/sh", "tabPosition": "prepend",
+        }
+        literal = gw.to_applescript(payload)
+        script = gw.APPLE_SCRIPT.replace("__PAYLOAD_LITERAL__", literal)
+        self.assertIn("executeMultiPane", script)
+        self.assertIn("paneOps", literal)
+        self.assertIn("paneLeaves", literal)
+
+
+class TestMultiPaneDryRun(unittest.TestCase):
+
+    def _run_dry(self, yaml_str):
+        import tempfile, os
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_str)
+            tmp = f.name
+        try:
+            with patch("sys.argv", ["ghostty-workspace", "-c", tmp, "--dry-run"]):
+                buf = io.StringIO()
+                with patch("sys.stdout", buf):
+                    try:
+                        gw.main()
+                    except SystemExit:
+                        pass
+            return buf.getvalue()
+        finally:
+            os.unlink(tmp)
+
+    def test_dry_run_shows_pane_count(self):
+        yaml_str = textwrap.dedent("""
+            window:
+              shell: /bin/sh
+            tabs:
+              - key: dev
+                title: Dev
+                layout: "2-2"
+                panes:
+                  - command: a
+                  - command: b
+                  - command: c
+                  - command: d
+        """)
+        out = self._run_dry(yaml_str)
+        self.assertIn("panes=4", out)
+        self.assertIn("splits=3", out)
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     try:

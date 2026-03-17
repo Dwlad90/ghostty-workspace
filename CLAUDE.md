@@ -10,7 +10,7 @@ A macOS utility that launches and manages a multi-tab Ghostty terminal workspace
 
 ```bash
 # Run tests (requires PyYAML)
-python3 tests.py
+python3 test_ghostty_workspace.py
 
 # Dry run (validate config, print planned actions)
 python3 ghostty-workspace.py --dry-run
@@ -38,6 +38,16 @@ Key design decisions:
 ## Config Format (ghostty-workspace.yaml)
 
 Top-level keys: `window` (settings like `shell`, `tab_position`, `reuse_existing_tabs`, `always_new`) and `tabs` (list). Each tab requires `key` (unique). Optional: `title` (unique, triggers Accessibility-based rename), `working_dir`, `command`, `shell`, `split` (with `direction`, `ratio`, `second_pane_command`), `focus`, `reuse_if_exists`, `enabled`.
+
+### Multi-pane (3+ panes per tab)
+
+Tabs can use `layout` + `panes` (shorthand) or a nested `panes` tree instead of `split`. These are mutually exclusive with `split`.
+
+- **Layout shorthand**: `layout: "2-2"` + flat `panes:` list. Presets: `duo`, `trio`, `quad`, `dashboard`.
+- **Tree notation**: `panes:` dict with `direction`, optional `ratio`, and nested `panes` children.
+- **Flat list**: `panes:` list without `layout` → side-by-side columns.
+
+Internally: `PaneNode` binary tree → `flatten_pane_tree()` → flat list of split ops + leaf configs → `executeMultiPane` AppleScript handler (two-phase: create all splits, then send commands).
 
 ## Dependencies
 

@@ -28,9 +28,9 @@ import os
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, NoReturn
+from typing import Any, Dict, List, Optional, NoReturn, Tuple, Union
 
 try:
     import yaml
@@ -51,6 +51,24 @@ class SplitConfig:
 
 
 @dataclass
+class PaneNode:
+    """Binary tree node for multi-pane layouts.
+
+    A leaf has command/working_dir (actual terminal pane).
+    A split has direction, ratio, and exactly 2 children.
+    """
+    command: Optional[str] = None
+    working_dir: Optional[str] = None
+    direction: Optional[str] = None
+    ratio: Optional[str] = None
+    children: Optional[Tuple[PaneNode, PaneNode]] = None
+
+    @property
+    def is_leaf(self) -> bool:
+        return self.children is None
+
+
+@dataclass
 class WindowConfig:
     shell: Optional[str] = None
     tab_position: str = "prepend"
@@ -68,6 +86,7 @@ class TabConfig:
     split: SplitConfig
     focus: bool = False
     reuse_if_exists: bool = True
+    pane_tree: Optional[PaneNode] = None
 
 
 def die(message: str, code: int = 2) -> NoReturn:
@@ -160,6 +179,157 @@ def parse_split(obj: Any) -> SplitConfig:
     )
 
 
+# ── Multi-pane helpers ────────────────────────────────────────────────────
+
+LAYOUT_PRESETS: Dict[str, str] = {
+    "duo": "1-1",
+    "trio": "1-2",
+    "quad": "2-2",
+    "dashboard": "1-3",
+}
+
+
+def _first_leaf(node: PaneNode) -> PaneNode:
+    """Return the leftmost/topmost leaf in a pane tree."""
+    if node.is_leaf:
+        return node
+    return _first_leaf(node.children[0])
+
+
+def _build_balanced_tree(nodes: List[PaneNode], direction: str) -> PaneNode:
+    """Build a right-skewed binary tree from N child nodes with equal sizing."""
+    if len(nodes) == 1:
+        return nodes[0]
+    if len(nodes) == 2:
+        return PaneNode(
+            direction=direction,
+            ratio=normalize_ratio("50/50"),
+            children=(nodes[0], nodes[1]),
+        )
+    n = len(nodes)
+    left_frac = 1.0 / n
+    right_frac = 1.0 - left_frac
+    ratio = f"{left_frac:.6f}/{right_frac:.6f}"
+    return PaneNode(
+        direction=direction,
+        ratio=ratio,
+        children=(nodes[0], _build_balanced_tree(nodes[1:], direction)),
+    )
+
+
+def parse_pane_tree(obj: Any, default_wd: Optional[str]) -> PaneNode:
+    """Parse a nested pane tree definition from YAML."""
+    if not isinstance(obj, dict):
+        die("pane node must be a mapping")
+
+    if "panes" in obj:
+        direction = str(obj.get("direction", "right"))
+        if direction not in {"right", "left", "up", "down"}:
+            die(f"invalid pane direction: {direction!r}")
+        children_raw = obj["panes"]
+        if not isinstance(children_raw, list):
+            die("'panes' inside a tree node must be a list")
+        children = [parse_pane_tree(c, default_wd) for c in children_raw]
+        if len(children) == 2:
+            ratio = normalize_ratio(obj.get("ratio", "50/50"))
+            return PaneNode(direction=direction, ratio=ratio,
+                            children=(children[0], children[1]))
+        elif len(children) > 2:
+            if "ratio" in obj:
+                die("'ratio' is not supported with more than 2 children")
+            return _build_balanced_tree(children, direction)
+        else:
+            die("pane split must have at least 2 children")
+    else:
+        wd = expand_path(str(obj.get("working_dir", ""))) if obj.get("working_dir") else default_wd
+        cmd = obj.get("command")
+        if cmd is not None:
+            cmd = str(cmd)
+        return PaneNode(command=cmd, working_dir=wd)
+
+
+def parse_layout_shorthand(
+    layout: str, panes_raw: List[Any], default_wd: Optional[str],
+) -> PaneNode:
+    """Convert a layout string like '2-2' + flat pane list into a PaneNode tree."""
+    layout = LAYOUT_PRESETS.get(layout, layout)
+    parts = layout.strip().split("-")
+    try:
+        row_counts = [int(p) for p in parts]
+    except ValueError:
+        die(f"invalid layout: {layout!r}")
+    total = sum(row_counts)
+    if total < 2:
+        die(f"layout must define at least 2 panes, got {total}")
+    if total != len(panes_raw):
+        die(f"layout '{layout}' expects {total} panes, got {len(panes_raw)}")
+
+    leaves: List[PaneNode] = []
+    for p in panes_raw:
+        if not isinstance(p, dict):
+            p = {}
+        wd = expand_path(str(p.get("working_dir", ""))) if p.get("working_dir") else default_wd
+        cmd = p.get("command")
+        if cmd is not None:
+            cmd = str(cmd)
+        leaves.append(PaneNode(command=cmd, working_dir=wd))
+
+    idx = 0
+    row_nodes: List[PaneNode] = []
+    for count in row_counts:
+        row_panes = leaves[idx:idx + count]
+        idx += count
+        if count == 1:
+            row_nodes.append(row_panes[0])
+        else:
+            row_nodes.append(_build_balanced_tree(row_panes, "right"))
+
+    if len(row_nodes) == 1:
+        return row_nodes[0]
+    return _build_balanced_tree(row_nodes, "down")
+
+
+def flatten_pane_tree(tree: PaneNode) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Flatten a PaneNode tree into linear split operations and leaf configs.
+
+    Returns (split_ops, pane_leaves) where:
+      split_ops[i]: {parentIndex, direction, ratio, newPaneWD}
+      pane_leaves[i]: {termIndex, paneCmd, paneWD}
+
+    Terminal 0 is the tab's primary terminal (already exists).
+    Each split_op creates a new terminal appended to the list.
+    """
+    ops: List[Dict[str, Any]] = []
+    leaves: List[Dict[str, Any]] = []
+    next_idx = [1]  # terminal 0 already exists
+
+    def visit(node: PaneNode, term_idx: int) -> None:
+        if node.is_leaf:
+            leaves.append({
+                "termIndex": term_idx,
+                "paneCmd": node.command or "",
+                "paneWD": node.working_dir or "",
+            })
+            return
+
+        new_idx = next_idx[0]
+        next_idx[0] += 1
+
+        right_first = _first_leaf(node.children[1])
+        ops.append({
+            "parentIndex": term_idx,
+            "direction": node.direction,
+            "ratio": node.ratio,
+            "newPaneWD": right_first.working_dir or "",
+        })
+
+        visit(node.children[0], term_idx)
+        visit(node.children[1], new_idx)
+
+    visit(tree, 0)
+    return ops, leaves
+
+
 def parse_window(data: Dict[str, Any]) -> WindowConfig:
     win = data.get("window")
     if win is None:
@@ -248,6 +418,29 @@ def parse_tabs(data: Dict[str, Any], window: WindowConfig) -> List[TabConfig]:
         else:
             reuse_if_exists = window.reuse_existing_tabs
 
+        # ── multi-pane layout ────────────────────────────────────────
+        pane_tree: Optional[PaneNode] = None
+        layout_str = item.get("layout")
+        panes_raw = item.get("panes")
+
+        if layout_str is not None and panes_raw is not None:
+            if not isinstance(panes_raw, list):
+                die(f"tab {key!r}: 'panes' must be a list when used with 'layout'")
+            pane_tree = parse_layout_shorthand(str(layout_str), panes_raw, working_dir)
+        elif panes_raw is not None and layout_str is None:
+            if isinstance(panes_raw, dict):
+                pane_tree = parse_pane_tree(panes_raw, working_dir)
+            elif isinstance(panes_raw, list):
+                # Flat list without layout → side-by-side columns
+                pane_tree = parse_layout_shorthand(
+                    str(len(panes_raw)), panes_raw, working_dir,
+                )
+            else:
+                die(f"tab {key!r}: 'panes' must be a mapping or list")
+
+        if pane_tree is not None and split.enabled:
+            die(f"tab {key!r}: cannot use both 'split' and 'panes'/'layout'")
+
         tabs.append(
             TabConfig(
                 key=key,
@@ -258,6 +451,7 @@ def parse_tabs(data: Dict[str, Any], window: WindowConfig) -> List[TabConfig]:
                 split=split,
                 focus=focus,
                 reuse_if_exists=reuse_if_exists,
+                pane_tree=pane_tree,
             )
         )
 
@@ -288,23 +482,33 @@ def build_payload(
 
     payload_tabs: List[Dict[str, Any]] = []
     for t in selected:
-        payload_tabs.append(
-            {
-                "key": t.key,
-                "title": t.title or "",
-                "workingDir": t.working_dir or "",
-                "command": t.command or "",
-                "shell": t.shell,
-                "reuseIfExists": t.reuse_if_exists,
-                "split": {
-                    "enabled": t.split.enabled,
-                    "direction": t.split.direction,
-                    "ratio": t.split.ratio,
-                    "secondPaneCommand": t.split.second_pane_command or "",
-                    "secondPaneWorkingDir": t.split.second_pane_working_dir or "",
-                },
-            }
-        )
+        tab_data: Dict[str, Any] = {
+            "key": t.key,
+            "title": t.title or "",
+            "workingDir": t.working_dir or "",
+            "command": t.command or "",
+            "shell": t.shell,
+            "reuseIfExists": t.reuse_if_exists,
+            "split": {
+                "enabled": t.split.enabled,
+                "direction": t.split.direction,
+                "ratio": t.split.ratio,
+                "secondPaneCommand": t.split.second_pane_command or "",
+                "secondPaneWorkingDir": t.split.second_pane_working_dir or "",
+            },
+        }
+
+        if t.pane_tree is not None:
+            ops, pane_leaves = flatten_pane_tree(t.pane_tree)
+            tab_data["hasMultiPane"] = True
+            tab_data["paneOps"] = ops
+            tab_data["paneLeaves"] = pane_leaves
+        else:
+            tab_data["hasMultiPane"] = False
+            tab_data["paneOps"] = []
+            tab_data["paneLeaves"] = []
+
+        payload_tabs.append(tab_data)
 
     return {
         "tabs": payload_tabs,
@@ -355,7 +559,7 @@ on run
         set reuseFlag to reuseIfExists of tabRec
         set splitRec to split of tabRec
 
-        set tabRef to my ensureTab(win, titleText, shellPath, workingDir, startupCmd, reuseFlag, splitRec)
+        set tabRef to my ensureTab(win, titleText, shellPath, workingDir, startupCmd, reuseFlag, splitRec, tabRec)
 
         if tabPosition is "prepend" then
             -- Slide the tab left until it sits at insertIndex.
@@ -384,7 +588,9 @@ on run
     end if
 end run
 
-on ensureTab(win, titleText, shellPath, workingDir, startupCmd, reuseFlag, splitRec)
+on ensureTab(win, titleText, shellPath, workingDir, startupCmd, reuseFlag, splitRec, tabRec)
+    set multiPane to hasMultiPane of tabRec
+
     tell application "Ghostty"
         set existingTab to missing value
         if reuseFlag then set existingTab to my findTabByTitle(win, titleText)
@@ -404,7 +610,7 @@ on ensureTab(win, titleText, shellPath, workingDir, startupCmd, reuseFlag, split
                 send key "enter" to termRef
                 delay 0.1
             end if
-            if (enabled of splitRec) then my ensureSplit(existingTab, shellPath, workingDir, splitRec)
+            if (not multiPane) and (enabled of splitRec) then my ensureSplit(existingTab, shellPath, workingDir, splitRec)
             return existingTab
         end if
 
@@ -414,7 +620,8 @@ on ensureTab(win, titleText, shellPath, workingDir, startupCmd, reuseFlag, split
         set cfg to new surface configuration
         set command of cfg to shellPath
         if workingDir is not "" then set initial working directory of cfg to workingDir
-        if startupCmd is not "" then set initial input of cfg to startupCmd & return
+        -- For multi-pane tabs, commands are sent in executeMultiPane, not via initial input
+        if (not multiPane) and startupCmd is not "" then set initial input of cfg to startupCmd & return
 
         set t to new tab in win with configuration cfg
         delay 0.4
@@ -430,13 +637,14 @@ on ensureTab(win, titleText, shellPath, workingDir, startupCmd, reuseFlag, split
     tell application "Ghostty"
         set t to my findTabByTitle(win, titleText)
         if t is missing value then
-            -- Fallback: grab the last tab in the window (the one we just created)
             set t to item -1 of (tabs of win as list)
         end if
     end tell
 
-    -- Handle split after title is set; terminal focus is now stable
-    if (enabled of splitRec) then
+    -- Handle pane layouts
+    if multiPane then
+        my executeMultiPane(t, shellPath, paneOps of tabRec, paneLeaves of tabRec)
+    else if (enabled of splitRec) then
         tell application "Ghostty"
             my ensureSplit(t, shellPath, workingDir, splitRec)
         end tell
@@ -485,6 +693,79 @@ on ensureSplit(tabRef, shellPath, workingDir, splitRec)
         focus primaryTerm
     end tell
 end ensureSplit
+
+on executeMultiPane(tabRef, shellPath, paneOps, paneLeaves)
+    tell application "Ghostty"
+        select tab tabRef
+        delay 0.15
+
+        -- termList: index 1 = the tab's initial terminal, grows with each split
+        set termList to {focused terminal of tabRef}
+
+        -- Phase 1: execute all split operations, building up termList
+        repeat with opItem in paneOps
+            set opRec to contents of opItem
+            set parentIdx to (parentIndex of opRec) + 1
+            set parentTerm to item parentIdx of termList
+            set splitDir to direction of opRec
+            set newPaneWD to newPaneWD of opRec
+
+            set splitCfg to new surface configuration
+            set command of splitCfg to shellPath
+            if newPaneWD is not "" then set initial working directory of splitCfg to newPaneWD
+
+            if splitDir is "right" then
+                set newTerm to split parentTerm direction right with configuration splitCfg
+            else if splitDir is "left" then
+                set newTerm to split parentTerm direction left with configuration splitCfg
+            else if splitDir is "down" then
+                set newTerm to split parentTerm direction down with configuration splitCfg
+            else
+                set newTerm to split parentTerm direction up with configuration splitCfg
+            end if
+
+            delay 0.25
+
+            -- Resize horizontal splits
+            if (splitDir is "right") or (splitDir is "left") then
+                set px to my splitResizePixels(ratio of opRec, splitDir)
+                perform action ("resize_split:" & splitDir & "," & px) on parentTerm
+            end if
+
+            set end of termList to newTerm
+        end repeat
+
+        -- Phase 2: send working directory + commands to each leaf pane
+        repeat with leafItem in paneLeaves
+            set leafRec to contents of leafItem
+            set leafIdx to (termIndex of leafRec) + 1
+            set leafTerm to item leafIdx of termList
+            set leafWD to paneWD of leafRec
+            set leafCmd to paneCmd of leafRec
+
+            -- For panes beyond the first, cd to their working dir
+            -- (the first pane inherited WD from tab creation; split panes got WD from surface config)
+            if leafIdx > 1 and leafWD is not "" then
+                focus leafTerm
+                delay 0.1
+                input text ("cd " & leafWD) to leafTerm
+                send key "enter" to leafTerm
+                delay 0.1
+            end if
+
+            if leafCmd is not "" then
+                focus leafTerm
+                delay 0.1
+                input text leafCmd to leafTerm
+                send key "enter" to leafTerm
+                delay 0.1
+            end if
+        end repeat
+
+        -- Return focus to the first pane
+        focus (item 1 of termList)
+    end tell
+end executeMultiPane
 
 on findTabByTitle(win, desiredTitle)
     tell application "Ghostty"
@@ -695,7 +976,13 @@ def main() -> int:
         print(f"config: {config_path}")
         print(f"window: {'new' if force_new else 'reuse front'}  shell={window_config.shell or '(per-tab)'}  tabs={window_config.tab_position}")
         for t in selected:
-            split_info = f"  split={t.split.direction} {t.split.ratio}" if t.split.enabled else ""
+            if t.pane_tree is not None:
+                ops, pane_leaves = flatten_pane_tree(t.pane_tree)
+                split_info = f"  panes={len(pane_leaves)} splits={len(ops)}"
+            elif t.split.enabled:
+                split_info = f"  split={t.split.direction} {t.split.ratio}"
+            else:
+                split_info = ""
             focus_marker = " [focus]" if t.focus else ""
             title_display = repr(t.title) if t.title else "(untitled)"
             print(f"  tab {t.key!r}: {title_display}  cmd={t.command or '(none)'}{split_info}{focus_marker}")
