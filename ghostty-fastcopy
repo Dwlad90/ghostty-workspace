@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# ghostty-fastcopy — tmux-fastcopy for Ghostty
+#
+# Captures the visible terminal content, overlays single/double letter hints
+# on every URL, path, git hash, UUID, IP, etc., and copies the chosen text
+# to the clipboard.
+#
+# Usage:
+#   ghostty-fastcopy          # trigger from shell (or a keybinding)
+#
+# Ghostty keybinding (add to ~/.config/ghostty/config):
+#   keybind = super+f=text:ghostty-fastcopy\n
+#
+# Requirements:
+#   - macOS with Ghostty
+#   - Python 3.9+
+#   - Accessibility enabled for the app running this script (System Preferences)
+
+set -euo pipefail
+
+# Resolve symlink to locate ghostty-fastcopy.py in the same repo directory
+SCRIPT_REAL="$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SCRIPT_REAL")"
+PY="$SCRIPT_DIR/ghostty-fastcopy.py"
+
+if [[ ! -f "$PY" ]]; then
+    echo "ghostty-fastcopy: missing $PY" >&2
+    exit 1
+fi
+
+# ── capture visible terminal content ─────────────────────────────────────────
+# Save clipboard → cmd+a (select_all) + cmd+c (copy) via System Events → restore
+
+saved_clip=$(pbpaste 2>/dev/null || true)
+
+terminal_text=$(osascript 2>/dev/null <<'ASEOF'
+tell application "Ghostty" to activate
+delay 0.05
+tell application "System Events"
+    tell process "Ghostty"
+        keystroke "a" using command down   -- select_all  (Ghostty default: super+a)
+        delay 0.15
+        keystroke "c" using command down   -- copy        (Ghostty default: super+c)
+        delay 0.1
+    end tell
+end tell
+return (the clipboard as text)
+ASEOF
+) || terminal_text=""
+
+printf '%s' "$saved_clip" | pbcopy 2>/dev/null || true   # restore clipboard
+
+if [[ -z "$terminal_text" ]]; then
+    echo "ghostty-fastcopy: could not capture terminal content" >&2
+    exit 1
+fi
+
+# ── launch curses overlay ────────────────────────────────────────────────────
+# Pass content via a temp file so stdin stays connected to the terminal (tty).
+# curses reads keystrokes from fd 0, so it MUST be the tty — not a pipe.
+tmpfile=$(mktemp)
+trap 'rm -f "$tmpfile"' EXIT
+printf '%s' "$terminal_text" > "$tmpfile"
+python3 "$PY" "$tmpfile"

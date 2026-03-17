@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Read(//Applications/Ghostty.app/Contents/Resources/**)",
+      "Read(//Applications/Ghostty.app/Contents/**)",
+      "Bash(osascript:*)"
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "github",
+    "context7",
+    "sequential-thinking"
+  ]
+}

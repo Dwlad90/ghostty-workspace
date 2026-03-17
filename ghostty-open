@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# ghostty-open — pick URLs from the visible Ghostty terminal and open them
+#
+# Like tmux-open, but for Ghostty on macOS.
+# Scans the visible terminal content (via AppleScript select_all + copy),
+# extracts every URL / file path, and lets you pick one with fzf.
+#
+# Usage:
+#   ghostty-open              # scan visible terminal content
+#   ghostty-open -e           # open in $EDITOR instead of the default app
+#   ghostty-open --editor     # same as -e
+#
+# Ghostty keybindings (add to ~/.config/ghostty/config):
+#   keybind = super+o=text:ghostty-open\n
+#   keybind = super+shift+o=text:ghostty-open -e\n
+#
+# Requirements:
+#   - macOS with Ghostty
+#   - fzf (falls back to AppleScript dialog if missing)
+#   - Accessibility enabled for the app running this script
+
+set -euo pipefail
+
+# ── args ──────────────────────────────────────────────────────────────────────
+
+USE_EDITOR=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -e|--editor) USE_EDITOR=true; shift ;;
+        -h|--help) sed -n '2,/^[^#]/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) echo "ghostty-open: unknown option: $1" >&2; exit 1 ;;
+        *) break ;;
+    esac
+done
+
+# ── capture terminal content ──────────────────────────────────────────────────
+# Save clipboard → cmd+a (select_all) + cmd+c (copy) via System Events → restore
+
+saved_clip=$(pbpaste 2>/dev/null || true)
+
+terminal_text=$(osascript 2>/dev/null <<'ASEOF'
+tell application "Ghostty" to activate
+delay 0.05
+tell application "System Events"
+    tell process "Ghostty"
+        keystroke "a" using command down   -- select_all (Ghostty default: super+a)
+        delay 0.15
+        keystroke "c" using command down   -- copy_to_clipboard (Ghostty default: super+c)
+        delay 0.1
+    end tell
+end tell
+return (the clipboard as text)
+ASEOF
+) || terminal_text=""
+
+printf '%s' "$saved_clip" | pbcopy 2>/dev/null || true  # restore clipboard
+
+# Fall back to saved clipboard if terminal capture failed or returned nothing useful
+[[ -z "$terminal_text" ]] && terminal_text="$saved_clip"
+
+if [[ -z "$terminal_text" ]]; then
+    echo "ghostty-open: clipboard is empty and terminal capture failed" >&2
+    exit 1
+fi
+
+# ── extract URLs and file paths ───────────────────────────────────────────────
+
+mapfile -t candidates < <(
+    # URLs: http / https / ftp / file schemes
+    grep -oE '(https?|ftp|file)://[^[:space:]"'"'"'<>()]+' <<< "$terminal_text" \
+        | sed "s/[)>\"';,.*]*$//" \
+        | sort -u \
+    || true
+)
+
+# File paths that actually exist on disk
+while IFS= read -r match; do
+    expanded="${match/#\~/$HOME}"
+    [[ -e "$expanded" ]] && candidates+=("$match")
+done < <(
+    grep -oE '(~|/)[^[:space:]"'"'"'<>]+' <<< "$terminal_text" | sort -u || true
+)
+
+# De-duplicate (file paths can overlap with URLs)
+declare -A _seen
+unique=()
+for c in "${candidates[@]:-}"; do
+    [[ -z "$c" ]] && continue
+    if [[ -z "${_seen[$c]+set}" ]]; then
+        _seen[$c]=1
+        unique+=("$c")
+    fi
+done
+
+if [[ ${#unique[@]} -eq 0 ]]; then
+    echo "ghostty-open: no URLs or paths found in terminal output" >&2
+    exit 1
+fi
+
+# ── pick with fzf (or AppleScript fallback) ───────────────────────────────────
+
+if command -v fzf &>/dev/null; then
+    selected=$(printf '%s\n' "${unique[@]}" | fzf --prompt="Open > " --height=~40% --no-sort)
+else
+    as_list=$(printf '%s\n' "${unique[@]}" | awk '{printf "\"%s\", ", $0}' | sed 's/, $//')
+    selected=$(
+        osascript -e "set ch to choose from list {$as_list} with title \"ghostty-open\" with prompt \"Open:\"" \
+            2>/dev/null | tr -d '\n'
+    )
+    [[ "$selected" == "false" ]] && exit 0
+fi
+
+[[ -z "$selected" ]] && exit 0
+
+# ── open ─────────────────────────────────────────────────────────────────────
+
+expanded="${selected/#\~/$HOME}"
+
+if $USE_EDITOR; then
+    exec "${EDITOR:-vi}" "$expanded"
+else
+    open "$expanded"
+fi

@@ -425,6 +425,16 @@ on ensureTab(win, titleText, shellPath, workingDir, startupCmd, reuseFlag, split
     -- Set the tab title via the prompt dialog (skip if no title configured)
     if titleText is not "" then my setSelectedTabTitle(titleText)
 
+    -- Re-fetch the tab by its new title: Ghostty may update the internal tab ID
+    -- when prompt_tab_title completes, making the original reference stale.
+    tell application "Ghostty"
+        set t to my findTabByTitle(win, titleText)
+        if t is missing value then
+            -- Fallback: grab the last tab in the window (the one we just created)
+            set t to item -1 of (tabs of win as list)
+        end if
+    end tell
+
     -- Handle split after title is set; terminal focus is now stable
     if (enabled of splitRec) then
         tell application "Ghostty"
@@ -488,21 +498,34 @@ on findTabByTitle(win, desiredTitle)
 end findTabByTitle
 
 on setSelectedTabTitle(newTitle)
-    tell application "Ghostty"
-        set termRef to focused terminal of selected tab of front window
-        perform action "prompt_tab_title" on termRef
-    end tell
-
-    delay 0.35
-
+    -- Open the "Change Tab Title" dialog via the View menu.
+    -- prompt_tab_title via perform action returns true but never shows a dialog
+    -- (Ghostty 1.3.x bug); clicking the menu item is reliable.
     tell application "System Events"
         tell process "Ghostty"
-            tell sheet 1 of front window
-                set value of text field 1 to newTitle
-                delay 0.05
-                click button "OK"
-            end tell
+            click menu item "Change Tab Title..." of menu "View" of menu bar item "View" of menu bar 1
         end tell
+    end tell
+
+    -- Wait up to 2 s for the dialog window to appear (count goes from 1 to 2)
+    set waited to 0
+    repeat while waited < 20
+        delay 0.1
+        set waited to waited + 1
+        try
+            tell application "System Events"
+                tell process "Ghostty"
+                    if (count of windows) > 1 then exit repeat
+                end tell
+            end tell
+        end try
+    end repeat
+
+    -- Type the title and confirm; keystrokes go to the focused dialog window
+    tell application "System Events"
+        keystroke newTitle
+        delay 0.05
+        keystroke return
     end tell
 
     delay 0.15
