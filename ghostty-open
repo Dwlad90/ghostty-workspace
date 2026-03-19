@@ -65,6 +65,8 @@ fi
 
 # ── extract URLs and file paths ───────────────────────────────────────────────
 
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+
 mapfile -t candidates < <(
     # URLs: http / https / ftp / file schemes
     grep -oE '(https?|ftp|file)://[^[:space:]"'"'"'<>()]+' <<< "$terminal_text" \
@@ -73,12 +75,41 @@ mapfile -t candidates < <(
     || true
 )
 
-# File paths that actually exist on disk
-while IFS= read -r match; do
+add_existing_path() {
+    local match="$1"
+    local expanded
+    [[ -z "$match" ]] && return
+
     expanded="${match/#\~/$HOME}"
-    [[ -e "$expanded" ]] && candidates+=("$match")
+    if [[ -e "$expanded" ]]; then
+        candidates+=("$match")
+        return
+    fi
+
+    # Git output can use repo-root-relative paths when run from subdirectories.
+    if [[ -n "$repo_root" && "$expanded" != /* && -e "$repo_root/$expanded" ]]; then
+        candidates+=("$repo_root/$expanded")
+    fi
+}
+
+# Absolute and home-relative paths.
+while IFS= read -r match; do
+    add_existing_path "$match"
 done < <(
-    grep -oE '(~|/)[^[:space:]"'"'"'<>]+' <<< "$terminal_text" | sort -u || true
+    grep -oE '(~|/)[^[:space:]"'"'"'<>]+' <<< "$terminal_text" \
+        | sed "s/[)>\"';,.*]*$//" \
+        | sort -u \
+    || true
+)
+
+# Relative paths with slashes (covers git output like "M src/file.ts", "create mode ... src/file.ts").
+while IFS= read -r match; do
+    add_existing_path "$match"
+done < <(
+    grep -oE '(\.\./|\./)?[[:alnum:]_.-]+(/[[:alnum:]_.-]+)+' <<< "$terminal_text" \
+        | sed "s/[)>\"';,.*]*$//" \
+        | sort -u \
+    || true
 )
 
 # De-duplicate (file paths can overlap with URLs)
