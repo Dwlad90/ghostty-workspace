@@ -27,13 +27,19 @@ PATTERNS: list[tuple[str, str]] = [
     ("macaddr",     r"(?i)\b([0-9A-F]{2}[:\-]){5}([0-9A-F]{2})\b"),
     ("creditcard",  r"\b(?:\d[ -]*?){13,16}\b"),
     ("phone",       r"\b\+?\d{1,4}?[-.\s]?\(?\d{1,3}?\)?[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9}\b"),
+    # Absolute and home-relative paths must come before "domain" so that
+    # ~/foo/bar.txt is matched as a path, not split into a domain at bar.txt.
+    ("path",        r"(?:(?:^|(?<!\w))(?:~(?=/)|/)[\w./\-~@%+=:,]+)"),
+    # Relative paths: bare segments separated by slashes — e.g. git status
+    # output, cargo paths, npm @scope/pkg.  Require at least one interior
+    # slash to avoid matching lone words.
+    ("rel_path",    r"(?<![/\w~])(?:\.\.?/)?[A-Za-z_][\w.@+\-]*(?:/[\w.@+:~\-]+)+"),
     ("domain",      r"(?i)\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,6}\b"),
     ("ssn",         r"\b\d{3}-\d{2}-\d{4}\b"),
     ("date",        r"\b\d{2}/\d{2}/\d{4}\b"),
     ("time",        r"\b\d{2}:\d{2}:\d{2}\b"),
     ("k8s",         r"\b[a-z0-9\-]+-[a-z0-9]{8,10}-[a-z0-9]{5}\b"),
     ("rust_test",   r"\b[a-z_]+(?:::[a-z_]+)*::[a-z_]+(?:::[a-z_]+)*\b"),
-    ("path",        r"(?:(?:^|(?<!\w))(?:~(?=/)|/)[\w./\-~@%+=:,]+)"),
     ("ipv4",        r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b"),
     ("git_hash_full",  r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])"),
     ("git_hash_short", r"(?<![0-9a-fA-F])[0-9a-fA-F]{7,12}(?![0-9a-fA-F])"),
@@ -79,6 +85,7 @@ class State:
     typed: str = ""
     selected: List[str] = field(default_factory=list)
     multi: bool = False
+    scroll_offset: int = 0  # first line of content visible on screen
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -124,13 +131,19 @@ def generate_hints(n: int) -> List[str]:
     return [a + b for a in alpha for b in alpha][:n]
 
 
-def build_state(content: str, cols: int) -> tuple[List[str], Optional[State]]:
+def build_state(content: str, cols: int, rows: int = 0) -> tuple[List[str], Optional[State]]:
     lines = wrap_lines(content, cols)
     matches = find_matches(lines)
     if not matches:
         return lines, None
-    hints = generate_hints(len(matches))
-    return lines, State(hints=hints, hint_map=dict(zip(hints, matches)))
+    # Assign hints bottom-first: most recent content (end of history) gets
+    # the shortest/earliest hints (a, b, c …) because it is most important.
+    bottom_first = list(reversed(matches))
+    hints = generate_hints(len(bottom_first))
+    hint_map = dict(zip(hints, bottom_first))
+    # Default scroll position: show the bottom of the content (most recent).
+    scroll_offset = max(0, len(lines) - max(rows - 1, 1))
+    return lines, State(hints=hints, hint_map=hint_map, scroll_offset=scroll_offset)
 
 
 # ── colour pairs ─────────────────────────────────────────────────────────────
@@ -156,8 +169,10 @@ def draw(stdscr: "curses._CursesWindow", lines: List[str], st: State) -> None:
     rows, cols = stdscr.getmaxyx()
     stdscr.erase()
 
+    offset = st.scroll_offset
+    visible = lines[offset: offset + rows - 1]
     dim = curses.color_pair(P_DIM) | curses.A_DIM
-    for r, line in enumerate(lines[: rows - 1]):
+    for r, line in enumerate(visible):
         try:
             stdscr.addnstr(r, 0, line, cols, dim)
         except curses.error:
@@ -165,8 +180,9 @@ def draw(stdscr: "curses._CursesWindow", lines: List[str], st: State) -> None:
 
     active = {h: m for h, m in st.hint_map.items() if h.startswith(st.typed)}
     for hint, match in active.items():
-        r, c = match.row, match.col
-        if r >= rows - 1 or c >= cols:
+        r = match.row - offset   # translate absolute row → screen row
+        c = match.col
+        if r < 0 or r >= rows - 1 or c >= cols:
             continue
         is_picked = match.text in st.selected
         typed_part = hint[: len(st.typed)]
@@ -190,11 +206,13 @@ def draw(stdscr: "curses._CursesWindow", lines: List[str], st: State) -> None:
     mode_tag  = " MULTI " if st.multi else ""
     typed_tag = f"  [{st.typed}]" if st.typed else ""
     picked    = f"  +{len(st.selected)} picked" if st.selected else ""
+    max_offset = max(0, len(lines) - (rows - 1))
+    scroll_tag = f"  ↕{offset}/{max_offset}" if max_offset > 0 else ""
     status = (
         f" ghostty-fastcopy{mode_tag} "
         f"{len(active)}/{len(st.hints)} hints  "
-        f"type {hint_len}-char hint | Tab multi | ESC/q quit"
-        f"{typed_tag}{picked}"
+        f"type {hint_len}-char hint | Tab multi | ↑↓ scroll | ESC/q quit"
+        f"{typed_tag}{picked}{scroll_tag}"
     )
     try:
         stdscr.addnstr(rows - 1, 0, status.ljust(cols)[:cols], cols, curses.A_REVERSE)
@@ -212,7 +230,7 @@ def run_overlay(stdscr: "curses._CursesWindow", content: str) -> Optional[List[s
     stdscr.timeout(100)
 
     rows, cols = stdscr.getmaxyx()
-    lines, st = build_state(content, cols)
+    lines, st = build_state(content, cols, rows)
     if st is None:
         return None
 
@@ -220,7 +238,7 @@ def run_overlay(stdscr: "curses._CursesWindow", content: str) -> Optional[List[s
         cur_rows, cur_cols = stdscr.getmaxyx()
         if cur_rows != rows or cur_cols != cols:
             rows, cols = cur_rows, cur_cols
-            lines, st_new = build_state(content, cols)
+            lines, st_new = build_state(content, cols, rows)
             if st_new is None:
                 return None
             st_new.multi = st.multi
@@ -257,6 +275,11 @@ def run_overlay(stdscr: "curses._CursesWindow", content: str) -> Optional[List[s
             st.multi = not st.multi
         elif key in ("KEY_BACKSPACE", "\x7f", "\b"):
             st.typed = st.typed[:-1]
+        elif key == "KEY_UP":
+            st.scroll_offset = max(0, st.scroll_offset - 1)
+        elif key == "KEY_DOWN":
+            max_offset = max(0, len(lines) - (rows - 1))
+            st.scroll_offset = min(max_offset, st.scroll_offset + 1)
         elif len(key) == 1 and key in string.ascii_lowercase:
             candidate = st.typed + key
             if any(h.startswith(candidate) for h in st.hint_map):

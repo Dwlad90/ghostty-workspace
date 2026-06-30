@@ -106,7 +106,7 @@ done < <(
 while IFS= read -r match; do
     add_existing_path "$match"
 done < <(
-    grep -oE '(\.\./|\./)?[[:alnum:]_.-]+(/[[:alnum:]_.-]+)+' <<< "$terminal_text" \
+    grep -oE '(\.\./|\./)?[[:alnum:]_@.-]+(/[[:alnum:]_@.+:~-]+)+' <<< "$terminal_text" \
         | sed "s/[)>\"';,.*]*$//" \
         | sort -u \
     || true
